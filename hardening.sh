@@ -3,20 +3,41 @@
 # ===============================================
 # Script de Hardening para Servidor Web en Ubuntu 22.04 LTS
 # ===============================================
-# Este script aplica varias medidas de seguridad
-# para endurecer la configuración de Ubuntu y un servidor web.
-# Incluye configuraciones específicas para servidores web,
-# como la instalación de ModSecurity, firewall y protección
-# de archivos y directorios.
+# Este script implementa múltiples medidas de seguridad
+# para fortalecer la configuración de un servidor Ubuntu
+# que funciona como servidor web. Incluye:
+#
+# - Actualización del sistema y gestión de paquetes.
+# - Configuración y endurecimiento del firewall UFW.
+# - Desactivación de servicios innecesarios.
+# - Instalación y configuración de ModSecurity como WAF.
+# - Configuración y aplicación de perfiles de AppArmor.
+# - Establecimiento de políticas de contraseñas más estrictas.
+# - Endurecimiento de la configuración del kernel con sysctl.
+# - Configuración segura del servicio SSH.
+# - Generación de un inventario de seguridad.
+# - Ejecución de Lynis para auditoría de seguridad.
+#
+# Además, se han añadido medidas adicionales para mejorar
+# aún más la seguridad del servidor.
 # ===============================================
 
-set -e  # Detener el script en caso de cualquier error
+# Verificar si el script se está ejecutando como root
+if [ "$EUID" -ne 0 ]; then
+  echo "Por favor, ejecuta este script como root."
+  exit 1
+fi
 
+# Habilitar modo estricto: el script se detendrá ante cualquier error
+set -e
+
+# Directorio de instalación donde se guardarán los archivos generados
 INSTALL_DIR="/root/instalacion"
-mkdir -p $INSTALL_DIR
+mkdir -p "$INSTALL_DIR"
 
+# Archivo de log donde se registrarán las acciones del script
 LOGFILE="$INSTALL_DIR/hardening_log.txt"
-exec > >(tee -i $LOGFILE) 2>&1  # Redirigir salida estándar y errores al archivo de log
+exec > >(tee -i "$LOGFILE") 2>&1  # Redirigir salida estándar y errores al archivo de log
 
 echo "Inicio del script de hardening para servidor web - $(date)"
 
@@ -24,71 +45,43 @@ echo "Inicio del script de hardening para servidor web - $(date)"
 # Función para registrar errores en el log
 # ===============================================
 log_error() {
-    echo "Error: $1 - $(date)" >> $LOGFILE
+    echo "Error: $1 - $(date)" >> "$LOGFILE"
 }
 
 # ===============================================
-# Solicitar IP del servidor
+# Función para verificar e instalar paquetes si no existen
 # ===============================================
-# Para configurar adecuadamente las reglas del firewall,
-# solicitamos al usuario la IP pública o privada del servidor.
-# Esta IP se usará para limitar el acceso a servicios críticos
-# como SSH, y para definir las reglas del firewall.
-# ===============================================
-echo "Por favor, introduce la IP que deseas usar para SSH y las reglas del firewall:"
-read -r SERVER_IP
-
-# ===============================================
-# Función para verificar e instalar paquetes si no existen durante la instalación.
-# ===============================================
-# En esta sección, se instalan los siguientes paquetes si no están
-# ya presentes en el sistema:
-#
-# 1. **`ufw`**: 
-#    - UFW (Uncomplicated Firewall) es una herramienta sencilla
-#      para gestionar las reglas del firewall. Nos permite
-#      controlar el tráfico entrante y saliente de la red.
-#
-# 2. **`libapache2-mod-security2`**:
-#    - ModSecurity es un firewall de aplicaciones web (WAF)
-#      que protege el servidor web contra ataques comunes como
-#      inyecciones SQL y XSS. Este módulo lo integra con Apache.
-#
-# 3. **`modsecurity-crs`**:
-#    - Conjunto de reglas de OWASP (Core Rule Set) que se utiliza
-#      junto con ModSecurity para detectar y prevenir amenazas
-#      en aplicaciones web.
-#
-# 4. **`apparmor`**:
-#    - AppArmor es un marco de seguridad que limita los permisos
-#      de las aplicaciones a través de perfiles predefinidos, 
-#      protegiendo el acceso a los recursos del sistema.
-#
-# 5. **`apparmor-profiles`**:
-#    - Este paquete proporciona perfiles adicionales para AppArmor,
-#      que aplican restricciones de acceso a aplicaciones comunes
-#      como Apache o MySQL.
-#
-# 6. **`apparmor-utils`**:
-#    - Herramientas adicionales para gestionar los perfiles de AppArmor,
-#      como `aa-enforce`, que fuerza a las aplicaciones a usar estos perfiles.
-#
-# 7. **`lynis`**:
-#    - Lynis es una herramienta de auditoría de seguridad que analiza
-#      el sistema en busca de configuraciones inseguras y vulnerabilidades,
-#      ofreciendo recomendaciones para mejorar la seguridad.
-# ===============================================
-
 check_and_install() {
     local package=$1
-    if dpkg -l | grep -q "^ii  $package "; then
+    if dpkg -l | grep -qw "$package"; then
         echo "$package ya está instalado."
     else
         echo "Instalando $package..."
-        if ! apt-get install -y $package; then
+        if ! apt-get install -y "$package"; then
             log_error "Error al instalar $package."
             exit 1
         fi
+    fi
+}
+
+# ===============================================
+# Función para desactivar servicios innecesarios
+# ===============================================
+check_and_manage_service() {
+    local service=$1
+    if systemctl list-unit-files | grep -qw "$service.service"; then
+        if systemctl is-active --quiet "$service"; then
+            echo "Desactivando y deteniendo el servicio $service..."
+            systemctl stop "$service"
+            systemctl disable "$service"
+            if [ $? -ne 0 ]; then
+                log_error "Error al desactivar el servicio $service."
+            fi
+        else
+            echo "El servicio $service no está activo."
+        fi
+    else
+        echo "El servicio $service no está instalado."
     fi
 }
 
@@ -104,54 +97,21 @@ fi
 # ===============================================
 # Configuración del Firewall (UFW)
 # ===============================================
-# UFW (Uncomplicated Firewall) es una herramienta sencilla
-# para la gestión de reglas de firewall en Ubuntu. En este
-# servidor web, configuramos UFW para:
-#
-# 1. **Denegar todas las conexiones entrantes**:
-#    Esto asegura que cualquier conexión no autorizada
-#    que intente acceder al servidor será bloqueada, protegiendo
-#    los servicios internos del servidor.
-#    Comando: ufw default deny incoming
-#
-# 2. **Permitir todas las conexiones salientes**:
-#    El servidor web puede iniciar conexiones hacia el exterior
-#    (por ejemplo, para descargar actualizaciones), pero ningún
-#    sistema externo puede iniciar conexiones al servidor excepto
-#    en los puertos permitidos explícitamente.
-#    Comando: ufw default allow outgoing
-#
-# 3. **Permitir conexiones SSH solo desde una IP específica**:
-#    Se restringe el acceso al servicio SSH únicamente desde la IP
-#    proporcionada por el administrador ($SERVER_IP), limitando
-#    así el riesgo de ataques de fuerza bruta o acceso no autorizado.
-#    Comando: ufw allow from $SERVER_IP to any port 22 proto tcp
-#
-# 4. **Permitir conexiones HTTP y HTTPS**:
-#    Dado que este es un servidor web, se habilitan las conexiones
-#    en los puertos 80 (HTTP) y 443 (HTTPS), permitiendo que los
-#    clientes puedan acceder a las aplicaciones web del servidor.
-#    Comandos: ufw allow 80/tcp (HTTP), ufw allow 443/tcp (HTTPS)
-#
-# Finalmente, se activa UFW y las reglas entran en funcionamiento.
-# Esto asegura que solo el tráfico esencial y permitido pueda
-# alcanzar el servidor web, mejorando considerablemente su seguridad.
-# ===============================================
-
+# UFW (Uncomplicated Firewall) se utiliza para gestionar las reglas del firewall de forma sencilla.
 echo "Instalando y configurando UFW..."
 check_and_install "ufw"
 
+# Configurar las políticas por defecto: denegar todas las conexiones entrantes y permitir las salientes
 echo "Configurando UFW para denegar todas las conexiones entrantes y permitir las salientes..."
 ufw default deny incoming
 ufw default allow outgoing
 
-echo "Permitiendo acceso SSH solo desde la IP especificada ($SERVER_IP)..."
-ufw allow from $SERVER_IP to any port 22 proto tcp
-
+# Permitir tráfico HTTP y HTTPS, esenciales para un servidor web
 echo "Configurando UFW para permitir tráfico HTTP y HTTPS..."
-ufw allow 80/tcp  # HTTP
-ufw allow 443/tcp  # HTTPS
+ufw allow 80/tcp    # HTTP
+ufw allow 443/tcp   # HTTPS
 
+# Habilitar UFW para que las reglas entren en efecto
 ufw enable
 if [ $? -ne 0 ]; then
     log_error "Error al configurar UFW."
@@ -161,46 +121,33 @@ fi
 # ===============================================
 # Desactivación de servicios innecesarios
 # ===============================================
-# rpcbind: Es un servicio utilizado para las comunicaciones RPC (Remote Procedure Call). 
-# En un servidor web, generalmente no se necesita y puede ser una puerta de entrada para ataques.
-# xinetd: Un superdemonio que gestiona otros servicios de red. En la mayoría de los servidores modernos, 
-# es innecesario ya que los servicios como SSH y HTTP/HTTPS son gestionados por systemd o
-# demonios dedicados como Apache/Nginx.
-# cups: Es el servicio de impresión de Linux. En un servidor web, no hay necesidad de gestionar impresoras,
-# por lo que es seguro desactivarlo.
-# avahi-daemon: Es un servicio para el descubrimiento automático de dispositivos en redes locales (DNS Multicast). 
-# Esto no es necesario en un servidor web, y podría ser un riesgo de seguridad si se deja habilitado.
-# ===============================================
+# Desactivamos servicios que no son necesarios y pueden representar un riesgo de seguridad
 echo "Desactivando servicios innecesarios..."
 services_to_check=("rpcbind" "xinetd" "cups" "avahi-daemon")
 for service in "${services_to_check[@]}"; do
-    check_and_manage_service $service
+    check_and_manage_service "$service"
 done
 
 # ===============================================
 # Instalación y configuración de ModSecurity (WAF)
 # ===============================================
-# ModSecurity es un WAF (Firewall de Aplicaciones Web)
-# que protege el servidor web contra ataques como XSS,
-# SQL Injection, y más. Se configura para funcionar con
-# Apache, pero también está disponible para Nginx.
-# ===============================================
+# ModSecurity actúa como un Firewall de Aplicaciones Web, protegiendo contra ataques comunes
 echo "Instalando y configurando ModSecurity..."
 check_and_install "libapache2-mod-security2"
 
 # Activar el módulo de seguridad en Apache
 a2enmod security2
 
-# Descargar el conjunto de reglas base de OWASP para ModSecurity
+# Instalar el conjunto de reglas base de OWASP para ModSecurity
 check_and_install "modsecurity-crs"
-cp /usr/share/modsecurity-crs/crs-setup.conf.example /etc/modsecurity/crs/crs-setup.conf
+if [ ! -f /etc/modsecurity/crs/crs-setup.conf ]; then
+    cp /usr/share/modsecurity-crs/crs-setup.conf.example /etc/modsecurity/crs/crs-setup.conf
+fi
 
-# Activar las reglas básicas de seguridad de ModSecurity
-cat <<EOF >> /etc/modsecurity/modsecurity.conf
-SecRuleEngine On
-EOF
+# Configurar ModSecurity para que esté en modo "On" en lugar de "DetectionOnly"
+sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' /etc/modsecurity/modsecurity.conf
 
-# Reiniciar Apache para aplicar cambios
+# Reiniciar Apache para aplicar los cambios
 systemctl restart apache2
 if [ $? -ne 0 ]; then
     log_error "Error al reiniciar Apache después de configurar ModSecurity."
@@ -210,6 +157,7 @@ fi
 # ===============================================
 # Configuración de AppArmor para control de acceso
 # ===============================================
+# AppArmor ayuda a restringir las capacidades de las aplicaciones
 echo "Revisando y configurando AppArmor..."
 check_and_install "apparmor"
 systemctl enable apparmor
@@ -231,92 +179,131 @@ fi
 # ===============================================
 # Políticas de contraseñas más estrictas
 # ===============================================
+# Configuramos políticas que requieren contraseñas más fuertes para todos los usuarios
 echo "Configurando políticas de contraseñas..."
 cat <<EOF > /etc/security/pwquality.conf
-minlen = 12
-dcredit = -1
-ucredit = -1
-lcredit = -1
-ocredit = -1
-retry = 3
+minlen = 12          # Longitud mínima de la contraseña
+dcredit = -1         # Requiere al menos un dígito
+ucredit = -1         # Requiere al menos una letra mayúscula
+lcredit = -1         # Requiere al menos una letra minúscula
+ocredit = -1         # Requiere al menos un carácter especial
+retry = 3            # Número de intentos permitidos
 EOF
 
+# Asegurar que las políticas se apliquen también al usuario root
 sed -i 's/# enforce_for_root/enforce_for_root/' /etc/pam.d/common-password
 
 # ===============================================
 # Endurecer la configuración del kernel con sysctl
 # ===============================================
+# Aplicamos configuraciones de seguridad al kernel para proteger contra ataques de red y mejorar la seguridad del sistema
 echo "Endureciendo la configuración del kernel..."
 cat <<EOF >> /etc/sysctl.conf
 # Protecciones de red
-net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.all.rp_filter = 1                  # Habilita filtrado de direcciones IP spoofed
 net.ipv4.conf.default.rp_filter = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 1
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.conf.all.log_martians = 1
+net.ipv4.tcp_syncookies = 1                      # Protege contra ataques SYN flood
+net.ipv4.conf.all.accept_source_route = 0        # Deshabilita rutas de origen
+net.ipv4.conf.all.accept_redirects = 0           # Deshabilita redirecciones ICMP
+net.ipv4.conf.all.secure_redirects = 1           # Acepta solo redirecciones ICMP seguras
+net.ipv4.icmp_echo_ignore_broadcasts = 1         # Ignora peticiones ICMP broadcast
+net.ipv4.icmp_ignore_bogus_error_responses = 1   # Ignora respuestas ICMP incorrectas
+net.ipv4.conf.all.log_martians = 1               # Loguea paquetes con direcciones inválidas
 
 # Protecciones de memoria
-kernel.randomize_va_space = 2
+kernel.randomize_va_space = 2                    # Habilita aleatorización de direcciones de memoria (ASLR)
 EOF
 
+# Aplicar los cambios de sysctl
 sysctl -p
 
 # ===============================================
 # Configuración de SSH (Secure Shell)
 # ===============================================
+# Configuramos SSH para mejorar su seguridad, deshabilitando el acceso root y estableciendo autenticación con claves
 echo "Configurando SSH..."
 echo "Introduce el nombre de usuario para el sistema SSH:"
 read -r SSH_USER
+
+# Verificar si el usuario existe; si no, crearlo
+if id "$SSH_USER" &>/dev/null; then
+    echo "El usuario $SSH_USER ya existe."
+else
+    echo "El usuario $SSH_USER no existe. Creándolo..."
+    useradd -m -s /bin/bash "$SSH_USER"
+    if [ $? -ne 0 ]; then
+        log_error "Error al crear el usuario $SSH_USER."
+        exit 1
+    fi
+    # Establecer una contraseña temporal (el administrador debe cambiarla después)
+    echo "Establece una contraseña para el usuario $SSH_USER:"
+    passwd "$SSH_USER"
+fi
+
 echo "Introduce el puerto para el servicio SSH (por defecto 22):"
 read -r SSH_PORT
 SSH_PORT=${SSH_PORT:-22}
 
-if [ ! -d "/home/$SSH_USER" ]; then
-    log_error "El directorio del usuario $SSH_USER no existe."
-    exit 1
-fi
+SSH_HOME="/home/$SSH_USER"
 
-mkdir -p "/home/$SSH_USER/.ssh"
-chmod 700 "/home/$SSH_USER/.ssh"
+# Crear el directorio .ssh si no existe y establecer los permisos correctos
+mkdir -p "$SSH_HOME/.ssh"
+chmod 700 "$SSH_HOME/.ssh"
+chown "$SSH_USER:$SSH_USER" "$SSH_HOME/.ssh"
 
+# Generar pares de claves SSH para el usuario especificado
 echo "Generando pares de claves SSH para el usuario $SSH_USER..."
-ssh-keygen -t rsa -b 4096 -f "/home/$SSH_USER/.ssh/id_rsa" -N "" -C "$SSH_USER@$(hostname)"
+sudo -u "$SSH_USER" ssh-keygen -t rsa -b 4096 -f "$SSH_HOME/.ssh/id_rsa" -N "" -C "$SSH_USER@$(hostname)"
 if [ $? -ne 0 ]; then
     log_error "Error al generar claves SSH."
     exit 1
 fi
 
-chmod 600 "/home/$SSH_USER/.ssh/id_rsa"
-chmod 644 "/home/$SSH_USER/.ssh/id_rsa.pub"
+chmod 600 "$SSH_HOME/.ssh/id_rsa"
+chmod 644 "$SSH_HOME/.ssh/id_rsa.pub"
+chown "$SSH_USER:$SSH_USER" "$SSH_HOME/.ssh/id_rsa" "$SSH_HOME/.ssh/id_rsa.pub"
 
-sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin no/" /etc/ssh/sshd_config
-sed -i "s/#PasswordAuthentication yes/PasswordAuthentication no/" /etc/ssh/sshd_config
-sed -i "s/#Port 22/Port $SSH_PORT/" /etc/ssh/sshd_config
+# Hacer copia de seguridad del archivo de configuración de SSH
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
+# Configurar SSH para deshabilitar el acceso root y la autenticación por contraseña
+sed -i "s/^#*PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/^#*PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+sed -i "s/^#*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+
+# Verificar la configuración de SSH antes de reiniciar el servicio
+if ! sshd -t; then
+    log_error "Configuración de SSH inválida. Restaurando copia de seguridad."
+    mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+    exit 1
+fi
+
+# Reiniciar el servicio SSH para aplicar los cambios
 systemctl restart ssh
 if [ $? -ne 0 ]; then
     log_error "Error al reiniciar el servicio SSH."
     exit 1
 fi
 
-echo "Actualizando la configuración del firewall para permitir el puerto SSH $SSH_PORT..."
-ufw allow $SSH_PORT/tcp
+# Actualizar las reglas del firewall para permitir conexiones SSH desde una IP específica
+echo "Actualizando la configuración del firewall para permitir el puerto SSH $SSH_PORT desde la IP especificada."
+echo "Por favor, introduce la IP que deseas usar para SSH y las reglas del firewall:"
+read -r SERVER_IP
+
+ufw allow from "$SERVER_IP" to any port "$SSH_PORT" proto tcp
 if [ $? -ne 0 ]; then
     log_error "Error al actualizar la configuración del firewall para el puerto SSH."
     exit 1
 fi
 
+# Guardar información de la configuración SSH en un archivo
 SSH_INFO="$INSTALL_DIR/ssh_info.txt"
 {
     echo "Información de configuración de SSH:"
     echo "Nombre de usuario: $SSH_USER"
-    echo "Ruta de claves SSH: /home/$SSH_USER/.ssh/id_rsa"
+    echo "Ruta de claves SSH: $SSH_HOME/.ssh/id_rsa"
     echo "Clave pública SSH:"
-    cat "/home/$SSH_USER/.ssh/id_rsa.pub"
+    cat "$SSH_HOME/.ssh/id_rsa.pub"
     echo "Puerto SSH configurado: $SSH_PORT"
 } > "$SSH_INFO"
 if [ $? -ne 0 ]; then
@@ -327,31 +314,32 @@ fi
 # ===============================================
 # Generación de inventario de seguridad
 # ===============================================
+# Crear un inventario detallado del sistema para fines de auditoría
 echo "Generando inventario de seguridad..."
 security_inventory="$INSTALL_DIR/security_inventory.txt"
 {
     echo "Información del Sistema:"
     uname -a
 
-    echo "Paquetes Instalados:"
+    echo -e "\nPaquetes Instalados:"
     dpkg -l
 
-    echo "Servicios Activos:"
+    echo -e "\nServicios Activos:"
     systemctl list-units --type=service --state=running
 
-    echo "Servicios Habilitados:"
+    echo -e "\nServicios Habilitados:"
     systemctl list-unit-files --type=service --state=enabled
 
-    echo "Configuración de SSH:"
+    echo -e "\nConfiguración de SSH:"
     grep -E '^PermitRootLogin|^PasswordAuthentication|^Port' /etc/ssh/sshd_config
 
-    echo "Estado de AppArmor:"
+    echo -e "\nEstado de AppArmor:"
     systemctl status apparmor
 
-    echo "Estado de Firewall (UFW):"
+    echo -e "\nEstado de Firewall (UFW):"
     ufw status verbose
 
-    echo "Permisos de Archivos Críticos:"
+    echo -e "\nPermisos de Archivos Críticos:"
     ls -l /etc/shadow /etc/passwd /etc/gshadow /etc/group
 } > "$security_inventory"
 if [ $? -ne 0 ]; then
@@ -362,6 +350,7 @@ fi
 # ===============================================
 # Ejecución de Lynis para auditoría de seguridad
 # ===============================================
+# Lynis es una herramienta que analiza el sistema y proporciona recomendaciones de seguridad
 echo "Instalando y ejecutando Lynis..."
 check_and_install "lynis"
 lynis audit system > "$INSTALL_DIR/lynis_audit.txt"
@@ -370,10 +359,58 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Guardar recomendaciones de endurecimiento de Lynis
 echo "Aplicando configuraciones adicionales de seguridad recomendadas por Lynis..."
-lynis hardening show >> "$INSTALL_DIR/lynis_hardening_recommendations.txt"
+lynis hardening show > "$INSTALL_DIR/lynis_hardening_recommendations.txt"
 
-echo "Hardening completado - $(date)" >> $LOGFILE
+# ===============================================
+# Medidas adicionales de seguridad
+# ===============================================
+# Añadimos algunas configuraciones extra para mejorar la seguridad
+
+# Configuración de actualizaciones automáticas de seguridad
+echo "Configurando actualizaciones automáticas de seguridad..."
+check_and_install "unattended-upgrades"
+dpkg-reconfigure -plow unattended-upgrades
+
+# Configuración de Fail2ban para proteger contra ataques de fuerza bruta
+echo "Instalando y configurando Fail2ban..."
+check_and_install "fail2ban"
+
+# Crear una configuración básica para SSH
+cat <<EOF > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+EOF
+
+# Reiniciar Fail2ban para aplicar la configuración
+systemctl restart fail2ban
+if [ $? -ne 0 ]; then
+    log_error "Error al reiniciar Fail2ban."
+    exit 1
+fi
+
+# Establecer permisos adecuados en archivos y directorios críticos
+echo "Estableciendo permisos en archivos críticos..."
+chmod 600 /etc/ssh/sshd_config
+chmod 640 /etc/shadow
+chmod 644 /etc/passwd
+chmod 640 /etc/gshadow
+chmod 644 /etc/group
+
+# Deshabilitar el montaje de dispositivos USB (opcional, si no se necesitan)
+echo "Deshabilitando montaje de dispositivos USB..."
+echo "blacklist usb-storage" > /etc/modprobe.d/usb-storage.conf
+update-initramfs -u
+
+# ===============================================
+# Finalización del script
+# ===============================================
+echo "Hardening completado - $(date)" >> "$LOGFILE"
 echo "El script ha terminado. Todos los archivos de instalación se encuentran en el directorio $INSTALL_DIR."
 
 
